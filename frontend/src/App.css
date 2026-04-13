@@ -1,0 +1,247 @@
+/* merged into App.jsx via second import — use App.module pattern or single file */
+.app {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem 1.25rem 4rem;
+}
+
+.header h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.tagline {
+  margin: 0 0 1rem;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.health {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.health-block {
+  max-width: 100%;
+}
+
+.health-detail {
+  opacity: 0.85;
+  font-size: 0.75rem;
+}
+
+.health .ok {
+  color: var(--hybrid);
+}
+
+.health .warn {
+  color: var(--danger);
+}
+
+.query-form {
+  margin-top: 1.75rem;
+  padding: 1.25rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.query-form label {
+  display: block;
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+  color: var(--muted);
+}
+
+.query-form textarea {
+  width: 100%;
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  resize: vertical;
+  margin-bottom: 1rem;
+}
+
+.weights {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.25rem;
+  margin-bottom: 1rem;
+}
+
+.weights label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex: 1;
+  min-width: 200px;
+}
+
+.weights input[type="range"] {
+  flex: 1;
+  accent-color: var(--accent);
+}
+
+.query-form button {
+  padding: 0.65rem 1.25rem;
+  border-radius: 8px;
+  border: none;
+  background: linear-gradient(135deg, var(--accent), var(--accent-dim));
+  color: #fff;
+  font-weight: 600;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+.query-form button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.error {
+  margin-top: 1rem;
+  padding: 0.75rem 1rem;
+  background: rgba(248, 113, 113, 0.12);
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  color: var(--danger);
+}
+
+.results {
+  margin-top: 2rem;
+}
+
+.results-title {
+  font-size: 1rem;
+  font-weight: 500;
+  margin-bottom: 0.5rem;
+}
+
+.weights-note {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin: 0 0 1.25rem;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1rem;
+}
+
+.panel {
+  padding: 1rem 1.1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  border-top: 3px solid var(--panel-accent, var(--accent));
+}
+
+.panel h3 {
+  margin: 0 0 0.75rem;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--panel-accent, var(--accent));
+}
+
+.panel h4 {
+  margin: 1rem 0 0.5rem;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.answer {
+  font-size: 0.95rem;
+  white-space: pre-wrap;
+}
+
+.chunk-list {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+.chunk-list li {
+  margin-bottom: 0.75rem;
+}
+
+.chunk-source {
+  display: inline-block;
+  font-size: 0.7rem;
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--accent);
+  margin-bottom: 0.25rem;
+}
+
+.chunk-preview {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.hybrid-insight {
+  margin-top: 2rem;
+  padding: 1.25rem 1.35rem;
+  background: linear-gradient(145deg, rgba(52, 211, 153, 0.08), var(--surface));
+  border: 1px solid rgba(52, 211, 153, 0.35);
+  border-radius: 12px;
+  border-left: 4px solid var(--hybrid);
+}
+
+.hybrid-insight h3 {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--hybrid);
+}
+
+.hybrid-insight ul {
+  margin: 0;
+  padding-left: 1.2rem;
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
+.hybrid-insight li {
+  margin-bottom: 0.65rem;
+  line-height: 1.5;
+}
+
+.insight-caveat {
+  margin: 1rem 0 0;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.8rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.footer {
+  margin-top: 3rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.footer code {
+  background: var(--surface);
+  padding: 0.2rem 0.45rem;
+  border-radius: 4px;
+}
