@@ -28,5 +28,8 @@ torch>=2.2.0
 huggingface-hub>=0.24.0
 python-dotenv>=1.0.0
 
+# Gemini generation (official Google Gen AI SDK — not legacy google-generativeai)
+google-genai>=1.0.0
+
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0

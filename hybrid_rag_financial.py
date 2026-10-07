@@ -2,8 +2,11 @@
 Hybrid RAG for financial / banking use case.
 
 Demonstrates BM25 vs dense vector vs Ensemble (hybrid) retrieval with LangChain,
-Chroma, HuggingFace Inference embeddings (BGE), and an LLM via **Anthropic Claude** (API),
-**Hugging Face** router chat, or local **Zephyr 7B** 4-bit — see ``build_llm``.
+Chroma, local (preferred) or remote BGE embeddings, plus an explicit RRF +
+cross-encoder path (``--smoke-retrieval``).
+
+Primary grounded answers: local retrieve → RRF → rerank → **Gemini**
+(``--ask-gemini``). Legacy demo compare path still supports Claude / HF / Zephyr.
 """
 
 from __future__ import annotations
@@ -59,13 +62,19 @@ LLM_MODEL_ID = "HuggingFaceH4/zephyr-7b-beta"
 HF_LLM_MODEL_DEFAULT = "meta-llama/Llama-3.2-1B-Instruct"
 # Anthropic Messages API (https://docs.anthropic.com/). Override with CLAUDE_MODEL in .env.
 CLAUDE_MODEL_DEFAULT = "claude-3-5-sonnet-20241022"
+# Demo compare path (BM25 / vector / EnsembleRetriever): small top-k for side-by-side answers.
 TOP_K = 3
+# Hybrid RRF + rerank path: larger candidate pools, then fuse, then rerank to final top-k.
+CANDIDATE_K = int(os.environ.get("CANDIDATE_K", "20"))
+RRF_TOP_N = int(os.environ.get("RRF_TOP_N", "20"))
+RERANK_TOP_K = int(os.environ.get("RERANK_TOP_K", "5"))
+RRF_K = int(os.environ.get("RRF_K", "60"))
 
-# Hugging Face Inference API: one huge embed_documents() call returns an error JSON dict;
-# Chroma then mis-indexes and raises KeyError. Batch instead (override with EMBEDDING_BATCH_SIZE).
+# Prefer local SentenceTransformers embeddings; set EMBEDDING_BACKEND=remote to force HF API.
+# Batching still used for remote (and harmless for local). Override with EMBEDDING_BATCH_SIZE.
 EMBEDDING_BATCH_SIZE = int(os.environ.get("EMBEDDING_BATCH_SIZE", "32"))
 
-# Ensemble default weights: [BM25, vector]
+# Ensemble default weights: [BM25, vector] — weighted RRF inside LangChain EnsembleRetriever.
 DEFAULT_ENSEMBLE_WEIGHTS: list[float] = [0.5, 0.5]
 
 
@@ -177,18 +186,34 @@ def chunk_documents(documents: Iterable[Document]) -> list[Document]:
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
     )
-    return splitter.split_documents(list(documents))
+    chunks = splitter.split_documents(list(documents))
+    # Stable ids for RRF dedup / future evaluation (do not invent page numbers).
+    for i, chunk in enumerate(chunks):
+        meta = dict(chunk.metadata or {})
+        src = str(meta.get("source", "doc")).replace(" ", "_")
+        meta["chunk_id"] = f"{src}::chunk_{i}"
+        chunk.metadata = meta
+    return chunks
 
 
 # ---------------------------------------------------------------------------
 # 3. Embeddings & Chroma vector store
 # ---------------------------------------------------------------------------
-def make_embeddings() -> Embeddings:
-    """
-    Remote embeddings via Hugging Face Inference (router); BGE base English v1.5.
+def make_local_embeddings() -> Embeddings:
+    """Local BGE via sentence-transformers (no embedding API cost)."""
+    from langchain_huggingface import HuggingFaceEmbeddings
 
-    Uses ``langchain_huggingface.HuggingFaceEndpointEmbeddings`` (``huggingface_hub``
-    ``InferenceClient``), not the deprecated ``api-inference.huggingface.co`` HTTP helper.
+    print(f"Embeddings: local SentenceTransformers — {EMBEDDING_MODEL_ID}")
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL_ID,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+
+def make_remote_embeddings() -> Embeddings:
+    """
+    Remote embeddings via Hugging Face Inference; same BGE model id.
 
     Set ``HUGGINGFACEHUB_API_TOKEN`` or ``HF_TOKEN`` in ``.env``.
     """
@@ -197,11 +222,34 @@ def make_embeddings() -> Embeddings:
         raise EnvironmentError(
             "Set HUGGINGFACEHUB_API_TOKEN (or HF_TOKEN) for HuggingFaceEndpointEmbeddings."
         )
+    print(f"Embeddings: remote HuggingFace Endpoint — {EMBEDDING_MODEL_ID}")
     return HuggingFaceEndpointEmbeddings(
         model=EMBEDDING_MODEL_ID,
         task="feature-extraction",
         huggingfacehub_api_token=token,
     )
+
+
+def make_embeddings() -> Embeddings:
+    """
+    Prefer local ``BAAI/bge-base-en-v1.5``; fall back to HF Inference API.
+
+    ``EMBEDDING_BACKEND``:
+      - ``local`` (default): SentenceTransformers on CPU
+      - ``remote`` / ``endpoint``: HuggingFaceEndpointEmbeddings (needs HF token)
+      - ``auto``: try local, then remote
+    """
+    backend = (os.environ.get("EMBEDDING_BACKEND") or "local").strip().lower()
+    if backend in ("remote", "endpoint", "api"):
+        return make_remote_embeddings()
+    if backend == "local":
+        return make_local_embeddings()
+    # auto
+    try:
+        return make_local_embeddings()
+    except Exception as exc:
+        print(f"Local embeddings failed ({exc!r}); falling back to remote HF endpoint.")
+        return make_remote_embeddings()
 
 
 def _prepare_chunks_for_chroma(chunks: list[Document]) -> list[Document]:
@@ -221,8 +269,8 @@ def _prepare_chunks_for_chroma(chunks: list[Document]) -> list[Document]:
 
 def build_vectorstore(chunks: list[Document]) -> Chroma:
     """
-    Index in small batches: HF Inference API rejects or errors on very large ``inputs`` arrays,
-    and ``response.json()`` then becomes a dict, which breaks Chroma's embedding alignment.
+    Index in batches. Batching matters most for remote HF Inference (large
+    ``inputs`` arrays can fail); it is also fine for local embeddings.
     """
     embedding_fn = make_embeddings()
     prepared = _prepare_chunks_for_chroma(chunks)
@@ -242,33 +290,70 @@ def build_vectorstore(chunks: list[Document]) -> Chroma:
     return vs
 
 
-def build_vectorstore_retriever(vectorstore: Chroma):
-    """Dense retriever: top_k = 3."""
-    return vectorstore.as_retriever(search_kwargs={"k": TOP_K})
+def build_vectorstore_retriever(vectorstore: Chroma, k: int | None = None):
+    """Dense retriever. Default ``k=TOP_K`` for the demo compare path."""
+    return vectorstore.as_retriever(search_kwargs={"k": TOP_K if k is None else k})
 
 
 # ---------------------------------------------------------------------------
 # 4. BM25 retriever
 # ---------------------------------------------------------------------------
-def build_bm25_retriever(chunks: list[Document]):
+def build_bm25_retriever(chunks: list[Document], k: int | None = None):
     keyword_retriever = BM25Retriever.from_documents(chunks)
-    keyword_retriever.k = TOP_K
+    keyword_retriever.k = TOP_K if k is None else k
     return keyword_retriever
 
 
 # ---------------------------------------------------------------------------
-# 5. Hybrid (ensemble) retriever
+# 5. Hybrid — EnsembleRetriever (weighted RRF, demo) + explicit RRF pipeline
 # ---------------------------------------------------------------------------
 def build_ensemble_retriever(
     bm25_retriever,
     vectorstore_retriever,
     weights: Sequence[float] | None = None,
 ):
+    """LangChain EnsembleRetriever (weighted RRF). Kept for weight-sweep demos."""
     w = list(weights) if weights is not None else list(DEFAULT_ENSEMBLE_WEIGHTS)
     return EnsembleRetriever(
         retrievers=[bm25_retriever, vectorstore_retriever],
         weights=w,
     )
+
+
+def build_rrf_rerank_retrievers(
+    chunks: list[Document],
+    vectorstore: Chroma,
+    *,
+    candidate_k: int | None = None,
+    with_reranker: bool = True,
+):
+    """
+    Candidate BM25 + dense retrievers (larger k) and HybridRRFRetriever.
+
+    Default path: BM25 + Dense → explicit RRF → cross-encoder → top ``RERANK_TOP_K``.
+    """
+    from retrieval.hybrid import build_hybrid_rrf_pipeline
+
+    ck = CANDIDATE_K if candidate_k is None else candidate_k
+    bm25 = build_bm25_retriever(chunks, k=ck)
+    dense = build_vectorstore_retriever(vectorstore, k=ck)
+
+    reranker = None
+    if with_reranker:
+        from reranking.cross_encoder import build_cross_encoder_reranker
+
+        reranker = build_cross_encoder_reranker()
+
+    pipeline = build_hybrid_rrf_pipeline(
+        bm25,
+        dense,
+        reranker=reranker,
+        rrf_k=RRF_K,
+        rrf_top_n=RRF_TOP_N,
+        rerank_top_k=RERANK_TOP_K,
+        id_key="chunk_id",
+    )
+    return bm25, dense, pipeline
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +811,137 @@ def parse_weights(s: str) -> list[float]:
     return [float(p) for p in parts]
 
 
+def smoke_test_retrieval(
+    query: str = "Impact of repo rate on EMI",
+    *,
+    with_reranker: bool = True,
+) -> None:
+    """
+    Stage-3 smoke test: load → embed (local preferred) → BM25+dense → RRF → rerank.
+
+    Does **not** call an LLM / Gemini.
+    """
+    print("=" * 80)
+    print("SMOKE TEST: Hybrid RRF + optional cross-encoder (no LLM)")
+    print("=" * 80)
+    print("Loading and chunking documents…")
+    all_docs = build_all_documents()
+    chunks = chunk_documents(all_docs)
+    print(f"Total leaf documents: {len(all_docs)}  |  Chunks: {len(chunks)}")
+
+    print("Building vector store (embeddings)…")
+    vectorstore = build_vectorstore(chunks)
+
+    print(
+        f"Building hybrid pipeline (candidate_k={CANDIDATE_K}, "
+        f"rrf_top_n={RRF_TOP_N}, rerank_top_k={RERANK_TOP_K}, reranker={with_reranker})…"
+    )
+    _bm25, _dense, pipeline = build_rrf_rerank_retrievers(
+        chunks, vectorstore, with_reranker=with_reranker
+    )
+
+    print(f"\nQuery: {query}")
+    rrf_only = pipeline.retrieve(query, use_reranker=False)
+    print(f"\n--- RRF fused candidates (top {min(len(rrf_only), 10)} of {len(rrf_only)}) ---")
+    for i, doc in enumerate(rrf_only[:10], start=1):
+        cid = (doc.metadata or {}).get("chunk_id", "?")
+        print(f"  [{i}] id={cid}  {preview_doc(doc)}")
+
+    if with_reranker:
+        final = pipeline.retrieve(query, use_reranker=True)
+        print(f"\n--- After cross-encoder rerank (top {len(final)}) ---")
+        for i, doc in enumerate(final, start=1):
+            cid = (doc.metadata or {}).get("chunk_id", "?")
+            score = (doc.metadata or {}).get("rerank_score")
+            score_s = f"{score:.4f}" if isinstance(score, (int, float)) else "?"
+            print(f"  [{i}] score={score_s} id={cid}  {preview_doc(doc)}")
+    print("\nSmoke test done (no LLM calls).")
+
+
+def answer_with_gemini(
+    query: str,
+    pipeline,
+    generator,
+    *,
+    context_top_k: int | None = None,
+    use_reranker: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Local retrieve (RRF + rerank) → send only top chunks to Gemini.
+
+    ``context_top_k`` defaults to ``RERANK_TOP_K`` (typically 3–5).
+    """
+    k = RERANK_TOP_K if context_top_k is None else context_top_k
+    docs = pipeline.retrieve(query, use_reranker=use_reranker)
+    docs = docs[: max(0, k)]
+    result = generator.generate(query, docs)
+    result["query"] = query
+    result["retrieved_chunks"] = [
+        {
+            "chunk_id": str((d.metadata or {}).get("chunk_id", "")),
+            "source": str((d.metadata or {}).get("source", "unknown")),
+            "rerank_score": (d.metadata or {}).get("rerank_score"),
+            "preview": preview_doc(d, 160),
+        }
+        for d in docs
+    ]
+    return result
+
+
+def run_gemini_qa(
+    queries: Sequence[str],
+    *,
+    with_reranker: bool = True,
+    context_top_k: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Stage-4 path: index once, then for each query retrieve locally and call Gemini.
+
+    Only the final small context (top 3–5 chunks) is sent to Gemini.
+    """
+    from generation.gemini import build_gemini_generator
+
+    print("=" * 80)
+    print("GEMINI QA: BM25 + Dense → RRF → Rerank → Gemini (small context only)")
+    print("=" * 80)
+    print("Loading and chunking documents…")
+    all_docs = build_all_documents()
+    chunks = chunk_documents(all_docs)
+    print(f"Total leaf documents: {len(all_docs)}  |  Chunks: {len(chunks)}")
+
+    print("Building vector store (embeddings)…")
+    vectorstore = build_vectorstore(chunks)
+    _bm25, _dense, pipeline = build_rrf_rerank_retrievers(
+        chunks, vectorstore, with_reranker=with_reranker
+    )
+    if not with_reranker:
+        # Still allow RRF-only context if user passes --no-reranker with --ask-gemini
+        pipeline.reranker = None
+
+    generator = build_gemini_generator()
+    k = RERANK_TOP_K if context_top_k is None else context_top_k
+    outputs: list[dict[str, Any]] = []
+
+    for q in queries:
+        print("\n" + "=" * 80)
+        print(f"Query: {q}")
+        out = answer_with_gemini(
+            q,
+            pipeline,
+            generator,
+            context_top_k=k,
+            use_reranker=with_reranker,
+        )
+        outputs.append(out)
+        print(f"\n--- Context sent to Gemini ({out['num_context_chunks']} chunks) ---")
+        for i, ch in enumerate(out.get("retrieved_chunks") or [], start=1):
+            print(f"  [{i}] {ch.get('chunk_id')} | {ch.get('preview')}")
+        print("\n--- Gemini answer ---")
+        print(out.get("answer") or "")
+    print("\nGemini QA done.")
+    return outputs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hybrid RAG financial demo")
     parser.add_argument(
@@ -734,7 +950,60 @@ def main() -> None:
         default="0.5,0.5",
         help="Comma-separated weights for EnsembleRetriever: BM25,Vector (e.g. 0.6,0.4)",
     )
+    parser.add_argument(
+        "--smoke-retrieval",
+        action="store_true",
+        help="Run Stage-3 retrieval smoke test only (no LLM).",
+    )
+    parser.add_argument(
+        "--smoke-query",
+        type=str,
+        default="Impact of repo rate on EMI",
+        help="Query used with --smoke-retrieval",
+    )
+    parser.add_argument(
+        "--no-reranker",
+        action="store_true",
+        help="Skip cross-encoder (RRF-only candidates) for smoke / Gemini paths.",
+    )
+    parser.add_argument(
+        "--ask-gemini",
+        action="store_true",
+        help="Retrieve locally (RRF+rerank) then answer with Gemini (needs GEMINI_API_KEY).",
+    )
+    parser.add_argument(
+        "--query",
+        action="append",
+        dest="queries",
+        default=None,
+        help="Query for --ask-gemini (repeatable). Defaults to a small demo set.",
+    )
+    parser.add_argument(
+        "--context-top-k",
+        type=int,
+        default=None,
+        help="Max chunks sent to Gemini (default: RERANK_TOP_K).",
+    )
     args = parser.parse_args()
+
+    if args.smoke_retrieval:
+        smoke_test_retrieval(args.smoke_query, with_reranker=not args.no_reranker)
+        return
+
+    if args.ask_gemini:
+        default_queries = [
+            "Impact of repo rate on EMI",
+            "What is CRR?",
+            "Why does EMI increase?",
+        ]
+        queries = args.queries if args.queries else default_queries
+        run_gemini_qa(
+            queries,
+            with_reranker=not args.no_reranker,
+            context_top_k=args.context_top_k,
+        )
+        return
+
     ensemble_weights = parse_weights(args.ensemble_weights)
     if len(ensemble_weights) != 2:
         raise SystemExit("--ensemble-weights must have exactly two values: BM25,Vector")
@@ -779,7 +1048,8 @@ def main() -> None:
         Expected behaviour (retrieval):
         - BM25: strong on exact phrases (e.g. CRR, repo rate, policy keywords in RBI text).
         - Vector: strong on paraphrases / concepts (EMI, inflation, transmission).
-        - Hybrid: merges both rank lists (RRF), usually most robust overall.
+        - Hybrid (EnsembleRetriever): weighted RRF of both lists (demo compare path).
+        - Also available: explicit RRF + cross-encoder via --smoke-retrieval (no LLM).
         """
     ).strip()
     print(intro)
